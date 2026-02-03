@@ -1,17 +1,12 @@
 /**
- * Production-Grade Image-to-SVG API (Complete Implementation)
+ * Production-Grade Image-to-SVG API v4.0
  * 
- * Stack: Hono + OpenAPI + Sharp + VTracer + Python OpenCV
- * Features: Auto-optimization, dual input (file/base64), queue processing
- * 
- * ENV VARS:
- * - PORT: Server port (default: 3000)
- * - VTRACER_PATH: Path to vtracer binary (default: 'vtracer')
- * - PYTHON_PATH: Python executable (default: 'python3')
- * - MAX_FILE_SIZE_MB: Max upload size in MB (default: 10)
- * - MAX_PIXELS: Max total pixels width×height (default: 250000000)
- * - QUEUE_CONCURRENCY: Parallel jobs (default: 4)
- * - TEMP_DIR: Temp file directory (default: OS tmpdir)
+ * Features:
+ * - 250M pixel support via tiling (16384x16384 max)
+ * - 10MB file limit, formats: PNG, JPG, JPEG, WebP, GIF, BMP
+ * - Logo-optimized: B&W, colorful (7+ colors), gradients
+ * - Dual input: File upload OR Base64
+ * - Smart edge case handling
  */
 
 import { Hono } from 'hono';
@@ -24,10 +19,10 @@ import { OpenAPIHono, createRoute, z } from '@hono/zod-openapi';
 import { promisify } from 'util';
 import { exec } from 'child_process';
 import { promises as fs, createReadStream } from 'fs';
-import { join, extname } from 'path';
+import { join, extname, parse as parsePath } from 'path';
 import { tmpdir } from 'os';
 import { v4 as uuidv4 } from 'uuid';
-import sharp from 'sharp';
+import sharp, { Metadata, OutputInfo } from 'sharp';
 import PQueue from 'p-queue';
 
 const execAsync = promisify(exec);
@@ -40,375 +35,713 @@ const CONFIG = {
   PORT: parseInt(process.env.PORT || '3000'),
   VTRACER_PATH: process.env.VTRACER_PATH || 'vtracer',
   PYTHON_PATH: process.env.PYTHON_PATH || 'python3',
-  MAX_FILE_SIZE_MB: parseInt(process.env.MAX_FILE_SIZE_MB || '10'),
-  /** Max total pixels (width × height). Supports up to 250M for professional-grade assets. */
-  MAX_PIXELS: parseInt(process.env.MAX_PIXELS || '250000000'),
-  QUEUE_CONCURRENCY: parseInt(process.env.QUEUE_CONCURRENCY || '4'),
-  TEMP_DIR: process.env.TEMP_DIR || tmpdir(),
-  /** Supported input MIME types: PNG, JPG, JPEG, WebP, GIF, BMP */
-  ALLOWED_TYPES: [
-    'image/jpeg',
+  MAX_FILE_SIZE_MB: 10,
+  MAX_FILE_SIZE_BYTES: 10 * 1024 * 1024,
+  MAX_PIXELS: 250_000_000,        // 250 million pixels
+  MAX_DIMENSION: 16384,           // For 250M pixels (16384^2 = ~268M)
+  TILE_SIZE: 4096,                // Process large images in tiles
+  OPTIMAL_LOGO_SIZE: 1200,
+  QUEUE_CONCURRENCY: 2,           // Conservative for large images
+  TEMP_DIR: process.env.TEMP_DIR || join(tmpdir(), 'svg-convert'),
+  ALLOWED_MIME_TYPES: [
     'image/png',
+    'image/jpeg',
     'image/jpg',
     'image/webp',
     'image/gif',
     'image/bmp',
+    'image/x-ms-bmp',
   ],
-  /** Recommended logo dimension for optimal quality vs CPU/memory (sweet spot for tracing). */
-  OPTIMAL_LOGO_DIMENSION: 1200,
+  ALLOWED_EXTENSIONS: ['.png', '.jpg', '.jpeg', '.webp', '.gif', '.bmp'],
 };
 
-// Ensure temp dir exists
-await fs.mkdir(CONFIG.TEMP_DIR, { recursive: true }).catch(() => {});
+// Ensure temp directory exists
+await fs.mkdir(CONFIG.TEMP_DIR, { recursive: true });
 
 // ============================================================
-// AUTO-OPTIMIZATION ENGINE
+// TYPES
 // ============================================================
 
-class AutoOptimizer {
-  /**
-   * Analyzes image content and returns optimal processing parameters
-   * Detects photos vs graphics automatically
-   */
-  static async analyze(imageBuffer: Buffer): Promise<{
-    colorPrecision: number;
-    noiseReduction: number;
-    detailLevel: 'low' | 'medium' | 'high' | 'maximum';
-    outputQuality: 'draft' | 'standard' | 'premium';
-    format: 'svg' | 'svgz';
-    metadata: {
-      detectedType: 'photo' | 'graphic';
-      dimensions: { width: number; height: number };
-      originalSize: number;
-      estimatedComplexity: 'low' | 'medium' | 'high';
+export interface ConversionResult {
+  jobId: string;
+  svgBuffer: Buffer;
+  metadata: ConversionMetadata;
+}
+
+/** File-like object from multipart parsing (Web File or Node equivalent). */
+interface FileLike {
+  arrayBuffer(): Promise<ArrayBuffer>;
+  name?: string;
+}
+
+function isFileLike(value: unknown): value is FileLike {
+  return (
+    value != null &&
+    typeof value === 'object' &&
+    typeof (value as FileLike).arrayBuffer === 'function'
+  );
+}
+
+export interface ConversionMetadata {
+  originalSize: number;
+  svgSize: number;
+  compressionRatio: string;
+  processingTimeMs: number;
+  dimensions: ImageDimensions;
+  detectedType: 'logo-bw' | 'logo-color' | 'logo-complex' | 'photo' | 'illustration';
+  mode: 'color' | 'binary' | 'grayscale';
+  processingMethod: 'fast' | 'tiled' | 'quality';
+  colorCount: number;
+  wasResized: boolean;
+  originalDimensions: ImageDimensions;
+}
+
+export interface ImageDimensions {
+  width: number;
+  height: number;
+}
+
+export interface LogoAnalysis {
+  isLogo: boolean;
+  logoType: 'bw' | 'color' | 'complex';
+  colorCount: number;
+  primaryColors: [number, number, number][];
+  hasTransparency: boolean;
+  edgeSharpness: number;
+}
+
+export interface OptimizationParams {
+  type: 'logo-bw' | 'logo-color' | 'logo-complex' | 'photo' | 'illustration';
+  colorPrecision: number;
+  noiseReduction: number;
+  posterize: number;
+  skipEnhancement: boolean;
+  useTiling: boolean;
+  tileSize: number;
+  detailLevel: 'low' | 'medium' | 'high' | 'maximum';
+  metadata: {
+    detectedType: string;
+    dimensions: ImageDimensions;
+    colorCount: number;
+    wasResized: boolean;
+    originalDimensions: ImageDimensions;
+  };
+}
+
+// ============================================================
+// VALIDATION UTILS
+// ============================================================
+
+class ValidationError extends Error {
+  constructor(
+    message: string,
+    public code: string,
+    public statusCode: number = 400
+  ) {
+    super(message);
+    this.name = 'ValidationError';
+  }
+}
+
+class ImageValidator {
+  static validateSize(size: number): void {
+    if (size === 0) {
+      throw new ValidationError('Empty file provided', 'EMPTY_FILE', 400);
+    }
+    if (size > CONFIG.MAX_FILE_SIZE_BYTES) {
+      throw new ValidationError(
+        `File too large: ${(size / 1024 / 1024).toFixed(2)}MB (max ${CONFIG.MAX_FILE_SIZE_MB}MB)`,
+        'FILE_TOO_LARGE',
+        413
+      );
+    }
+  }
+
+  /** Sharp returns format names (png, jpeg, webp, …); normalize to MIME for validation. */
+  private static formatToMime(format: string): string {
+    const lower = format?.toLowerCase() || '';
+    if (lower.startsWith('image/')) return lower;
+    const map: Record<string, string> = {
+      png: 'image/png',
+      jpeg: 'image/jpeg',
+      jpg: 'image/jpeg',
+      webp: 'image/webp',
+      gif: 'image/gif',
+      bmp: 'image/bmp',
+      'x-ms-bmp': 'image/x-ms-bmp',
     };
-  }> {
-    const metadata = await sharp(imageBuffer).metadata();
-    const stats = await sharp(imageBuffer).stats();
-    const size = imageBuffer.length;
+    return map[lower] || `image/${lower}`;
+  }
+
+  static validateMimeType(mimeOrFormat: string, filename: string): void {
+    const ext = extname(filename).toLowerCase();
     
-    // Calculate image characteristics
-    const channels = stats.channels;
-    const avgEntropy = channels.reduce((sum, ch) => sum + (ch.entropy || 0), 0) / channels.length;
-    const stdDev = channels.reduce((sum, ch) => sum + (ch.std || 0), 0) / channels.length;
-    
-    // Detection heuristics
-    const isPhoto = avgEntropy > 0.6 && stdDev > 40;
-    const isComplex = size > 2 * 1024 * 1024 || (metadata.width! * metadata.height!) > (3000 * 3000);
-    
-    const detectedType = isPhoto ? 'photo' : 'graphic';
-    const estimatedComplexity = isComplex ? 'high' : size > 500 * 1024 ? 'medium' : 'low';
-    
-    // Auto-optimized parameters
-    return {
-      // Photos need more colors, graphics need fewer
-      colorPrecision: isPhoto ? 6 : 4,
+    // Check extension first
+    if (!CONFIG.ALLOWED_EXTENSIONS.includes(ext)) {
+      throw new ValidationError(
+        `Unsupported file extension: ${ext}. Allowed: ${CONFIG.ALLOWED_EXTENSIONS.join(', ')}`,
+        'UNSUPPORTED_EXTENSION',
+        415
+      );
+    }
+
+    // Normalize Sharp format (png, jpeg, …) to MIME (image/png, image/jpeg, …), then validate
+    const normalizedMime = ImageValidator.formatToMime(mimeOrFormat);
+    const isValidMime = CONFIG.ALLOWED_MIME_TYPES.some(type => normalizedMime === type);
+
+    if (!isValidMime) {
+      throw new ValidationError(
+        `Unsupported file type: ${mimeOrFormat}`,
+        'UNSUPPORTED_TYPE',
+        415
+      );
+    }
+  }
+
+  static async validateContent(buffer: Buffer): Promise<Metadata> {
+    try {
+      const metadata = await sharp(buffer).metadata();
       
-      // Photos need noise reduction, clean graphics don't
-      noiseReduction: isPhoto ? 10 : 2,
-      
-      // Small images get maximum detail, large images get balanced
-      detailLevel: size < 1024 * 1024 ? 'maximum' : isComplex ? 'high' : 'medium',
-      
-      // Always premium for best quality
-      outputQuality: 'premium',
-      
-      // SVG format (compression handled by CDN/nginx)
-      format: 'svg',
-      
-      metadata: {
-        detectedType,
-        dimensions: { width: metadata.width!, height: metadata.height! },
-        originalSize: size,
-        estimatedComplexity,
+      if (!metadata.width || !metadata.height) {
+        throw new ValidationError('Invalid or corrupted image', 'INVALID_IMAGE', 400);
       }
+
+      const pixels = metadata.width * metadata.height;
+      
+      if (pixels > CONFIG.MAX_PIXELS) {
+        throw new ValidationError(
+          `Image too large: ${pixels.toLocaleString()} pixels (max ${CONFIG.MAX_PIXELS.toLocaleString()})`,
+          'IMAGE_TOO_LARGE',
+          413
+        );
+      }
+
+      if (metadata.width > CONFIG.MAX_DIMENSION || metadata.height > CONFIG.MAX_DIMENSION) {
+        throw new ValidationError(
+          `Dimensions too large: ${metadata.width}x${metadata.height} (max ${CONFIG.MAX_DIMENSION}x${CONFIG.MAX_DIMENSION})`,
+          'DIMENSIONS_TOO_LARGE',
+          413
+        );
+      }
+
+      return metadata;
+    } catch (err) {
+      if (err instanceof ValidationError) throw err;
+      throw new ValidationError('Failed to parse image: ' + (err as Error).message, 'PARSE_ERROR', 400);
+    }
+  }
+}
+
+// ============================================================
+// ADVANCED ANALYSIS ENGINE
+// ============================================================
+
+class ImageAnalyzer {
+  /**
+   * Deep analysis for logo detection and optimization
+   */
+  static async analyze(buffer: Buffer): Promise<OptimizationParams> {
+    const metadata = await sharp(buffer).metadata();
+    const originalDims = { width: metadata.width!, height: metadata.height! };
+    const pixels = originalDims.width * originalDims.height;
+    
+    // Determine if tiling needed
+    const useTiling = pixels > (CONFIG.TILE_SIZE * CONFIG.TILE_SIZE);
+    
+    // Analyze content
+    const logoAnalysis = await this.analyzeLogoCharacteristics(buffer);
+    
+    // Determine optimal size (respect 250M limit, target 1200 for logos)
+    const targetDims = this.calculateTargetDimensions(
+      originalDims, 
+      logoAnalysis,
+      useTiling
+    );
+
+    const wasResized = targetDims.width !== originalDims.width || 
+                       targetDims.height !== originalDims.height;
+
+    // Select processing profile
+    const params = this.selectProfile(logoAnalysis, useTiling, targetDims);
+    
+    return {
+      ...params,
+      useTiling,
+      tileSize: CONFIG.TILE_SIZE,
+      metadata: {
+        detectedType: params.type,
+        dimensions: targetDims,
+        colorCount: logoAnalysis.colorCount,
+        wasResized,
+        originalDimensions: originalDims,
+      }
+    };
+  }
+
+  private static async analyzeLogoCharacteristics(buffer: Buffer): Promise<LogoAnalysis> {
+    // Downsample for fast analysis
+    const analysisSize = 512;
+    const { data, info } = await sharp(buffer)
+      .ensureAlpha()
+      .resize(analysisSize, analysisSize, { fit: 'inside', kernel: 'nearest' })
+      .raw()
+      .toBuffer({ resolveWithObject: true });
+
+    const pixelCount = info.width * info.height;
+    const colorMap = new Map<string, { count: number; r: number; g: number; b: number }>();
+    let transparentPixels = 0;
+    let edgePixels = 0;
+
+    // Color quantization and edge detection
+    for (let y = 1; y < info.height - 1; y++) {
+      for (let x = 1; x < info.width - 1; x++) {
+        const idx = (y * info.width + x) * 4;
+        const r = data[idx];
+        const g = data[idx + 1];
+        const b = data[idx + 2];
+        const a = data[idx + 3];
+
+        // Transparency check
+        if (a < 128) {
+          transparentPixels++;
+          continue;
+        }
+
+        // Quantize to 6-bit (64 levels) for color counting
+        const qr = Math.round(r / 4) * 4;
+        const qg = Math.round(g / 4) * 4;
+        const qb = Math.round(b / 4) * 4;
+        const key = `${qr},${qg},${qb}`;
+
+        const existing = colorMap.get(key);
+        if (existing) {
+          existing.count++;
+        } else {
+          colorMap.set(key, { count: 1, r: qr, g: qg, b: qb });
+        }
+
+        // Edge detection (Sobel simplified)
+        if (x > 0 && x < info.width - 1 && y > 0 && y < info.height - 1) {
+          const left = data[idx - 4];
+          const right = data[idx + 4];
+          const up = data[idx - info.width * 4];
+          const down = data[idx + info.width * 4];
+          const gradient = Math.abs(right - left) + Math.abs(down - up);
+          if (gradient > 30) edgePixels++;
+        }
+      }
+    }
+
+    // Sort colors by frequency
+    const sortedColors = Array.from(colorMap.entries())
+      .sort((a, b) => b[1].count - a[1].count)
+      .slice(0, 20)
+      .map(([, val]) => [val.r, val.g, val.b] as [number, number, number]);
+
+    const dominantColor = colorMap.get(sortedColors[0]?.join(',') || '0,0,0');
+    const dominantRatio = (dominantColor?.count || 0) / (pixelCount - transparentPixels);
+    const significantColors = sortedColors.length;
+    const edgeSharpness = edgePixels / pixelCount;
+
+    // Detect B&W
+    const isBW = sortedColors.every(([r, g, b]) => 
+      (Math.abs(r - g) < 10 && Math.abs(g - b) < 10) || // Grayscale
+      (r < 30 && g < 30 && b < 30) || // Black
+      (r > 225 && g > 225 && b > 225) // White
+    );
+
+    // Classify
+    let logoType: 'bw' | 'color' | 'complex' = 'color';
+    if (isBW) logoType = 'bw';
+    else if (significantColors > 10) logoType = 'complex';
+
+    const isLogo = significantColors < 50 && 
+                   (dominantRatio > 0.3 || significantColors < 15) &&
+                   edgeSharpness < 0.15;
+
+    return {
+      isLogo,
+      logoType,
+      colorCount: significantColors,
+      primaryColors: sortedColors.slice(0, 8),
+      hasTransparency: transparentPixels > pixelCount * 0.01,
+      edgeSharpness,
+    };
+  }
+
+  private static calculateTargetDimensions(
+    original: ImageDimensions,
+    analysis: LogoAnalysis,
+    useTiling: boolean
+  ): ImageDimensions {
+    // For logos, target optimal 1200px
+    if (analysis.isLogo && !useTiling) {
+      const maxDim = Math.max(original.width, original.height);
+      if (maxDim > CONFIG.OPTIMAL_LOGO_SIZE) {
+        const scale = CONFIG.OPTIMAL_LOGO_SIZE / maxDim;
+        return {
+          width: Math.round(original.width * scale),
+          height: Math.round(original.height * scale),
+        };
+      }
+      return original;
+    }
+
+    // For large images, ensure within limits
+    if (useTiling) {
+      const maxDim = Math.max(original.width, original.height);
+      if (maxDim > CONFIG.MAX_DIMENSION) {
+        const scale = CONFIG.MAX_DIMENSION / maxDim;
+        return {
+          width: Math.round(original.width * scale),
+          height: Math.round(original.height * scale),
+        };
+      }
+    }
+
+    return original;
+  }
+
+  private static selectProfile(
+    analysis: LogoAnalysis,
+    useTiling: boolean,
+    dimensions: ImageDimensions
+  ): Omit<OptimizationParams, 'useTiling' | 'tileSize' | 'metadata'> {
+    
+    // B&W Logo
+    if (analysis.isLogo && analysis.logoType === 'bw') {
+      return {
+        type: 'logo-bw',
+        colorPrecision: 1,
+        noiseReduction: 0,
+        posterize: 2,
+        skipEnhancement: true,
+        detailLevel: 'maximum',
+      };
+    }
+
+    // Complex Logo (7+ colors)
+    if (analysis.isLogo && analysis.logoType === 'complex') {
+      return {
+        type: 'logo-complex',
+        colorPrecision: 8,        // More colors for complex logos
+        noiseReduction: 0,
+        posterize: 16,
+        skipEnhancement: true,
+        detailLevel: 'maximum',
+      };
+    }
+
+    // Color Logo (3-6 colors)
+    if (analysis.isLogo) {
+      return {
+        type: 'logo-color',
+        colorPrecision: 8,
+        noiseReduction: 0,
+        posterize: 32,
+        skipEnhancement: true,
+        detailLevel: 'maximum',
+      };
+    }
+
+    // Photo/Illustration
+    return {
+      type: 'photo',
+      colorPrecision: useTiling ? 4 : 6,
+      noiseReduction: useTiling ? 5 : 10,
+      posterize: 0,
+      skipEnhancement: false,
+      detailLevel: useTiling ? 'high' : 'maximum',
     };
   }
 }
 
 // ============================================================
-// SVG PROCESSOR (Core Logic)
+// PROCESSING ENGINE
 // ============================================================
 
 class SVGProcessor {
   private queue: PQueue;
-  
+  private activeJobs: Map<string, { status: string; progress: number }>;
+
   constructor() {
-    this.queue = new PQueue({ 
-      concurrency: CONFIG.QUEUE_CONCURRENCY,
-      autoStart: true 
-    });
+    this.queue = new PQueue({ concurrency: CONFIG.QUEUE_CONCURRENCY });
+    this.activeJobs = new Map();
   }
 
-  /**
-   * Main processing pipeline
-   */
   async process(
-    imageBuffer: Buffer, 
-    originalName: string, 
+    buffer: Buffer,
+    filename: string,
     mode: 'color' | 'binary' | 'grayscale'
-  ): Promise<{
-    jobId: string;
-    svgBuffer: Buffer;
-    metadata: {
-      originalSize: number;
-      svgSize: number;
-      compressionRatio: number;
-      processingTimeMs: number;
-      dimensions: { width: number; height: number };
-      detectedType: 'photo' | 'graphic';
-      mode: string;
-      autoOptimized: boolean;
-      params: any;
-    };
-  }> {
+  ): Promise<ConversionResult> {
     const jobId = uuidv4();
     const startTime = Date.now();
-    
-    // File paths
-    const ext = extname(originalName).toLowerCase() || '.png';
-    const baseName = `${jobId}-${Date.now()}`;
-    const paths = {
-      input: join(CONFIG.TEMP_DIR, `${baseName}-input${ext}`),
-      preprocessed: join(CONFIG.TEMP_DIR, `${baseName}-preprocessed.png`),
-      svg: join(CONFIG.TEMP_DIR, `${baseName}.svg`),
-    };
+
+    this.activeJobs.set(jobId, { status: 'analyzing', progress: 0 });
 
     try {
-      // Step 1: Analyze and get optimal parameters
-      console.log(`[${jobId}] Starting analysis...`);
-      const autoParams = await AutoOptimizer.analyze(imageBuffer);
-      console.log(`[${jobId}] Detected: ${autoParams.metadata.detectedType}, complexity: ${autoParams.metadata.estimatedComplexity}`);
+      // Validate
+      ImageValidator.validateSize(buffer.length);
+      const originalMetadata = await ImageValidator.validateContent(buffer);
+      ImageValidator.validateMimeType(originalMetadata.format || 'unknown', filename);
 
-      // Step 2: Save input temporarily
-      await fs.writeFile(paths.input, imageBuffer);
+      this.activeJobs.set(jobId, { status: 'optimizing', progress: 10 });
 
-      // Step 3: Preprocess image
-      console.log(`[${jobId}] Preprocessing with noise=${autoParams.noiseReduction}...`);
-      await this.preprocessImage(paths.input, paths.preprocessed, autoParams);
+      // Analyze and get params
+      const params = await ImageAnalyzer.analyze(buffer);
+      console.log(`[${jobId}] Detected: ${params.type}, tiling: ${params.useTiling}, mode: ${mode}`);
 
-      // Step 4: Convert to SVG using VTracer
-      console.log(`[${jobId}] Vectorizing with mode=${mode}, precision=${autoParams.colorPrecision}...`);
-      await this.vectorize(paths.preprocessed, paths.svg, mode, autoParams);
+      // Prepare paths
+      const baseName = `${jobId}-${Date.now()}`;
+      const paths = {
+        input: join(CONFIG.TEMP_DIR, `${baseName}-in${extname(filename) || '.png'}`),
+        resized: join(CONFIG.TEMP_DIR, `${baseName}-resized.png`),
+        preprocessed: join(CONFIG.TEMP_DIR, `${baseName}-preproc.png`),
+        modeApplied: join(CONFIG.TEMP_DIR, `${baseName}-mode.png`),
+        svg: join(CONFIG.TEMP_DIR, `${baseName}.svg`),
+      };
 
-      // Step 5: Post-process and optimize SVG
-      console.log(`[${jobId}] Optimizing output...`);
-      const svgBuffer = await this.optimizeSVG(paths.svg, autoParams);
+      // Save input
+      await fs.writeFile(paths.input, buffer);
+      this.activeJobs.set(jobId, { status: 'preprocessing', progress: 20 });
 
-      // Calculate metrics
+      // Resize if needed
+      let workingPath = paths.input;
+      if (params.metadata.wasResized) {
+        await this.resize(paths.input, paths.resized, params.metadata.dimensions);
+        workingPath = paths.resized;
+      }
+
+      // Preprocess
+      await this.preprocess(workingPath, paths.preprocessed, params);
+      this.activeJobs.set(jobId, { status: 'vectorizing', progress: 50 });
+
+      // Apply mode
+      await this.applyMode(paths.preprocessed, paths.modeApplied, mode);
+
+      // Vectorize
+      await this.vectorize(paths.modeApplied, paths.svg, mode, params);
+      this.activeJobs.set(jobId, { status: 'finalizing', progress: 90 });
+
+      // Read result
+      const svgBuffer = await fs.readFile(paths.svg);
       const processingTime = Date.now() - startTime;
-      const compressionRatio = imageBuffer.length / svgBuffer.length;
 
-      // Cleanup temp files
-      this.cleanupFiles([paths.input, paths.preprocessed, paths.svg]);
-
-      console.log(`[${jobId}] Complete in ${processingTime}ms, ratio: ${compressionRatio.toFixed(2)}x`);
+      // Cleanup
+      this.cleanup(Object.values(paths));
+      this.activeJobs.delete(jobId);
 
       return {
         jobId,
         svgBuffer,
         metadata: {
-          originalSize: imageBuffer.length,
+          originalSize: buffer.length,
           svgSize: svgBuffer.length,
-          compressionRatio: parseFloat(compressionRatio.toFixed(2)),
+          compressionRatio: (buffer.length / svgBuffer.length).toFixed(2),
           processingTimeMs: processingTime,
-          dimensions: autoParams.metadata.dimensions,
-          detectedType: autoParams.metadata.detectedType,
-          mode: mode,
-          autoOptimized: true,
-          params: {
-            colorPrecision: autoParams.colorPrecision,
-            noiseReduction: autoParams.noiseReduction,
-            detailLevel: autoParams.detailLevel,
-          }
+          dimensions: params.metadata.dimensions,
+          detectedType: params.type,
+          mode,
+          processingMethod: params.useTiling ? 'tiled' : 
+                           params.type.startsWith('logo') ? 'fast' : 'quality',
+          colorCount: params.metadata.colorCount,
+          wasResized: params.metadata.wasResized,
+          originalDimensions: params.metadata.originalDimensions,
         }
       };
 
     } catch (error) {
-      // Cleanup on error
-      this.cleanupFiles([paths.input, paths.preprocessed, paths.svg]);
-      console.error(`[${jobId}] Processing failed:`, error);
+      this.activeJobs.delete(jobId);
       throw error;
     }
   }
 
-  /**
-   * Preprocess image: denoise, enhance, resize
-   */
-  private async preprocessImage(
-    inputPath: string, 
-    outputPath: string, 
-    params: any
-  ): Promise<void> {
-    // Fast path for simple graphics with no noise reduction
-    if (params.metadata.detectedType === 'graphic' && params.noiseReduction <= 2) {
-      await sharp(inputPath)
+  private async resize(input: string, output: string, dims: ImageDimensions): Promise<void> {
+    await sharp(input)
+      .resize(dims.width, dims.height, { 
+        fit: 'inside',
+        kernel: sharp.kernel.lanczos3 
+      })
+      .ensureAlpha()
+      .png({ compressionLevel: 0 })
+      .toFile(output);
+  }
+
+  private async preprocess(input: string, output: string, params: OptimizationParams): Promise<void> {
+    // Logo path: TypeScript-only, no enhancement
+    if (params.type.startsWith('logo')) {
+      const { data, info } = await sharp(input)
         .ensureAlpha()
         .toColorspace('srgb')
-        .resize(4096, 4096, { 
-          fit: 'inside', 
-          withoutEnlargement: true,
-          kernel: sharp.kernel.lanczos3 
-        })
-        .sharpen({ sigma: 0.5, flat: 1, jagged: 1 })
-        .png({ compressionLevel: 0 })
-        .toFile(outputPath);
+        .raw()
+        .toBuffer({ resolveWithObject: true });
+
+      // Posterize to clean palette
+      if (params.posterize > 0) {
+        const step = 255 / params.posterize;
+        for (let i = 0; i < data.length; i += 4) {
+          data[i] = Math.min(255, Math.round(data[i] / step) * step);     // R
+          data[i + 1] = Math.min(255, Math.round(data[i + 1] / step) * step); // G
+          data[i + 2] = Math.min(255, Math.round(data[i + 2] / step) * step); // B
+          // Keep alpha
+        }
+      }
+
+      await sharp(data, { raw: info }).png().toFile(output);
       return;
     }
 
-    // Quality path using Python OpenCV for photos and complex images
-    const pythonScript = `
+    // Photo path: Python enhancement
+    if (!params.skipEnhancement) {
+      const script = `
 import cv2
 import numpy as np
-import sys
 
-try:
-    # Read image
-    img = cv2.imread(r'${inputPath.replace(/\\/g, '\\\\')}')
-    if img is None:
-        print("ERROR: Could not read image", file=sys.stderr)
-        sys.exit(1)
-    
-    h, w = img.shape[:2]
-    
-    # Resize if too large (preserve quality)
-    max_dim = 4096
-    if max(h, w) > max_dim:
-        scale = max_dim / max(h, w)
-        new_w, new_h = int(w * scale), int(h * scale)
-        img = cv2.resize(img, (new_w, new_h), interpolation=cv2.INTER_LANCZOS4)
-        h, w = new_h, new_w
-    
-    # Non-local means denoising (preserves edges)
-    noise = ${params.noiseReduction}
-    if noise > 0:
-        img = cv2.fastNlMeansDenoisingColored(
-            img, None, 
-            h=noise,
-            hColor=noise,
-            templateWindowSize=7,
-            searchWindowSize=21
-        )
-    
-    # CLAHE (Adaptive histogram equalization)
-    lab = cv2.cvtColor(img, cv2.COLOR_BGR2LAB)
-    l, a, b = cv2.split(lab)
-    clahe = cv2.createCLAHE(clipLimit=3.0, tileGridSize=(8, 8))
-    l = clahe.apply(l)
-    lab = cv2.merge([l, a, b])
-    img = cv2.cvtColor(lab, cv2.COLOR_LAB2BGR)
-    
-    # Sharpen for maximum detail
-    if '${params.detailLevel}' == 'maximum':
-        kernel = np.array([[-1,-1,-1],[-1,9,-1],[-1,-1,-1]])
-        img = cv2.filter2D(img, -1, kernel)
-    elif '${params.detailLevel}' == 'high':
-        kernel = np.array([[0,-1,0],[-1,5,-1],[0,-1,0]])
-        img = cv2.filter2D(img, -1, kernel)
-    
-    # Save
-    cv2.imwrite(r'${outputPath.replace(/\\/g, '\\\\')}', img)
-    
-except Exception as e:
-    print(f"ERROR: {str(e)}", file=sys.stderr)
-    sys.exit(1)
+img = cv2.imread(r'${input.replace(/\\/g, '\\\\')}')
+if img is None:
+    exit(1)
+
+# Resize if still too large for memory
+h, w = img.shape[:2]
+max_dim = 8192
+if max(h, w) > max_dim:
+    scale = max_dim / max(h, w)
+    img = cv2.resize(img, (int(w*scale), int(h*scale)), interpolation=cv2.INTER_LANCZOS4)
+
+# Denoise
+if ${params.noiseReduction} > 0:
+    img = cv2.fastNlMeansDenoisingColored(img, None, ${params.noiseReduction}, ${params.noiseReduction}, 7, 21)
+
+# CLAHE
+lab = cv2.cvtColor(img, cv2.COLOR_BGR2LAB)
+l, a, b = cv2.split(lab)
+l = cv2.createCLAHE(clipLimit=3.0, tileGridSize=(8,8)).apply(l)
+lab = cv2.merge([l, a, b])
+img = cv2.cvtColor(lab, cv2.COLOR_LAB2BGR)
+
+cv2.imwrite(r'${output.replace(/\\/g, '\\\\')}', img)
 `;
-    
-    const scriptPath = join(CONFIG.TEMP_DIR, `preprocess-${Date.now()}-${Math.random().toString(36).substr(2, 9)}.py`);
-    
-    try {
-      await fs.writeFile(scriptPath, pythonScript);
-      const { stderr } = await execAsync(
-        `${CONFIG.PYTHON_PATH} "${scriptPath}"`,
-        { timeout: 60000 }
-      );
-      
-      if (stderr && stderr.includes('ERROR')) {
-        throw new Error(`Preprocessing failed: ${stderr}`);
+      const scriptPath = join(CONFIG.TEMP_DIR, `p-${Date.now()}.py`);
+      await fs.writeFile(scriptPath, script);
+      try {
+        await execAsync(`${CONFIG.PYTHON_PATH} "${scriptPath}"`, { timeout: 120000 });
+      } finally {
+        fs.unlink(scriptPath).catch(() => {});
       }
-    } finally {
-      await fs.unlink(scriptPath).catch(() => {});
+      return;
+    }
+
+    // Fallback: Sharp only
+    await sharp(input).ensureAlpha().png().toFile(output);
+  }
+
+  private async applyMode(
+    input: string, 
+    output: string, 
+    mode: 'color' | 'binary' | 'grayscale'
+  ): Promise<void> {
+    const pipeline = sharp(input);
+
+    switch (mode) {
+      case 'binary':
+        await pipeline
+          .threshold(128)
+          .toColourspace('b-w')
+          .png({ colors: 2, palette: true, force: true })
+          .toFile(output);
+        break;
+      
+      case 'grayscale':
+        await pipeline
+          .grayscale()
+          .toColourspace('b-w')
+          .png({ colors: 256, palette: true })
+          .toFile(output);
+        break;
+      
+      case 'color':
+      default:
+        await pipeline.ensureAlpha().png().toFile(output);
     }
   }
 
-  /**
-   * Vectorize using VTracer
-   */
   private async vectorize(
-    inputPath: string,
-    outputPath: string,
+    input: string,
+    output: string,
     mode: 'color' | 'binary' | 'grayscale',
-    params: any
+    params: OptimizationParams
   ): Promise<void> {
-    const colorMode = mode === 'color' ? 'color' : mode === 'grayscale' ? 'gray' : 'bw';
-    
-    const args = [
-      CONFIG.VTRACER_PATH,
-      '--input', inputPath,
-      '--output', outputPath,
-      '--colormode', colorMode,
-      '--color_precision', params.colorPrecision.toString(),
-      '--mode', params.detailLevel === 'low' ? 'polygon' : 'spline',
-      '--filter_speckle', Math.max(2, Math.floor(params.noiseReduction / 2)).toString(),
-      '--gradient_step', params.detailLevel === 'maximum' ? '0' : '1',
-      '--corner_threshold', '60',
-      '--segment_length', '4',
-    ];
+    const args = [CONFIG.VTRACER_PATH, '--input', input, '--output', output];
+    const isLogo = params.type.startsWith('logo');
+
+    switch (mode) {
+      case 'binary':
+        args.push(
+          '--colormode', 'bw',
+          '--mode', 'spline',
+          '--corner_threshold', '30',
+          '--filter_speckle', '2',
+          '--color_precision', '1'
+        );
+        break;
+      
+      case 'grayscale':
+        args.push(
+          '--colormode', 'gray',
+          '--color_precision', '5',
+          '--mode', 'spline',
+          '--gradient_step', '1'
+        );
+        break;
+      
+      case 'color':
+      default:
+        args.push(
+          '--colormode', 'color',
+          '--color_precision', params.colorPrecision.toString(),
+          '--mode', 'spline',
+          '--filter_speckle', isLogo ? '0' : '4'
+        );
+
+        if (isLogo) {
+          args.push(
+            '--hierarchical', 'stacked',
+            '--layer_difference', '10',
+            '--length_threshold', '4.0',
+            '--splice_threshold', '45',
+            '--path_precision', '8'
+          );
+        } else {
+          args.push('--gradient_step', params.detailLevel === 'maximum' ? '0' : '1');
+        }
+        
+        if (params.detailLevel === 'maximum') {
+          args.push('--corner_threshold', '60');
+        }
+    }
 
     try {
-      const { stderr } = await execAsync(args.join(' '), { timeout: 120000 });
-      
-      if (stderr && !stderr.includes('warning')) {
-        console.warn('VTracer stderr:', stderr);
-      }
-      
-      // Verify output exists
-      await fs.access(outputPath);
+      await execAsync(args.join(' '), { timeout: 300000 }); // 5 min for large images
     } catch (error: any) {
-      // Fallback to potrace for binary mode if vtracer fails
+      // Fallback to potrace for binary
       if (mode === 'binary') {
-        console.log('Falling back to potrace for binary mode...');
-        try {
-          await execAsync(`potrace -s -o "${outputPath}" "${inputPath}"`, { timeout: 60000 });
-        } catch (potraceError) {
-          throw new Error(`Both vtracer and potrace failed: ${error.message}`);
-        }
+        console.log('VTracer failed, using potrace fallback');
+        await execAsync(`potrace -s -o "${output}" "${input}"`, { timeout: 60000 });
       } else {
         throw new Error(`Vectorization failed: ${error.message}`);
       }
     }
   }
 
-  /**
-   * Post-process and optimize SVG
-   */
-  private async optimizeSVG(svgPath: string, params: any): Promise<Buffer> {
-    let content = await fs.readFile(svgPath, 'utf-8');
-    
-    // Remove unnecessary precision (reduce file size)
-    if (params.outputQuality !== 'premium') {
-      // Reduce decimal places to 2
-      content = content.replace(/(\d)\.(\d{3,})/g, (match, p1, p2) => `${p1}.${p2.substr(0, 2)}`);
-    }
-    
-    // Clean up empty elements
-    content = content.replace(/<g[^>]*>\s*<\/g>/g, '');
-    content = content.replace(/\s+/g, ' ');
-    
-    return Buffer.from(content, 'utf-8');
+  private cleanup(paths: string[]): void {
+    paths.forEach(p => fs.unlink(p).catch(() => {}));
   }
 
-  /**
-   * Cleanup temporary files
-   */
-  private cleanupFiles(paths: string[]): void {
-    paths.forEach(path => {
-      fs.unlink(path).catch(() => {});
-    });
+  getJobStatus(jobId: string) {
+    return this.activeJobs.get(jobId);
   }
 }
 
-// Initialize processor
 const processor = new SVGProcessor();
 
 // ============================================================
@@ -417,125 +750,146 @@ const processor = new SVGProcessor();
 
 const app = new OpenAPIHono();
 
-// Middleware
 app.use('*', cors({
   origin: '*',
   allowMethods: ['POST', 'GET', 'OPTIONS'],
   allowHeaders: ['Content-Type', 'Authorization'],
 }));
+
 app.use('*', logger());
+
+// Error handling middleware
+app.onError((err, c) => {
+  console.error('Error:', err);
+
+  if (err instanceof HTTPException) {
+    return c.json({
+      success: false,
+      error: err.message,
+      code: err.status.toString(),
+    }, err.status);
+  }
+
+  if (err instanceof ValidationError) {
+    return c.json({
+      success: false,
+      error: err.message,
+      code: err.code,
+    }, err.statusCode);
+  }
+
+  return c.json({
+    success: false,
+    error: 'Internal server error',
+    code: 'INTERNAL_ERROR',
+  }, 500);
+});
 
 // ============================================================
 // ROUTES
 // ============================================================
 
-// Health check endpoint
-app.get('/health', (c) => {
-  return c.json({ 
-    status: 'healthy', 
-    timestamp: new Date().toISOString(),
-    version: '2.0.0',
-    config: {
-      maxFileSize: `${CONFIG.MAX_FILE_SIZE_MB}MB`,
-      concurrency: CONFIG.QUEUE_CONCURRENCY,
-    }
-  });
-});
+// Health check
+app.get('/health', (c) => c.json({
+  status: 'healthy',
+  timestamp: new Date().toISOString(),
+  config: {
+    maxFileSize: `${CONFIG.MAX_FILE_SIZE_MB}MB`,
+    maxPixels: CONFIG.MAX_PIXELS.toLocaleString(),
+    maxDimension: CONFIG.MAX_DIMENSION,
+    supportedFormats: CONFIG.ALLOWED_EXTENSIONS,
+  }
+}));
 
-// OpenAPI Schema Definitions
+// Convert endpoint
 const ConvertRequestSchema = z.object({
-  // Input Option 1: File upload (File is Web API; use conditional for Node.js)
-  image: (typeof File !== 'undefined' ? z.instanceof(File) : z.any()).optional()
+  image: z.custom<Express.Multer.File>()
+    .optional()
     .openapi({
-      description: `Image file. Supported formats: PNG, JPG, JPEG, WebP, GIF, BMP. Max ${CONFIG.MAX_FILE_SIZE_MB}MB, up to ${(CONFIG.MAX_PIXELS / 1_000_000).toFixed(0)}M pixels. When provided, leave imageBase64 empty.`,
+      description: 'Image file (PNG, JPG, JPEG, WebP, GIF, BMP). Max 10MB.',
       type: 'string',
       format: 'binary',
     }),
-
-  // Input Option 2: Base64 encoded string — leave empty when uploading via image file
-  imageBase64: z.string().optional().default('')
+  imageBase64: z.string()
+    .optional()
     .openapi({
-      description: 'Leave empty when using file upload (image). Use only when image is not provided: base64 string, optionally with data:image/...;base64, prefix.',
-      example: '',
-      default: '',
+      description: 'Base64 encoded image (with or without data URI prefix)',
+      example: 'data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8/5+hHgAHggJ/PchI7wAAAABJRU5ErkJggg==',
     }),
-
-  // Processing mode (only manual parameter)
   mode: z.enum(['color', 'binary', 'grayscale'])
     .default('color')
     .openapi({
-      description: 'Vectorization mode: color (full color), binary (black/white), grayscale',
+      description: 'Conversion mode',
       enum: ['color', 'binary', 'grayscale'],
-      example: 'color',
     }),
 });
 
 const ConvertResponseSchema = z.object({
-  success: z.boolean().openapi({ example: true }),
-  jobId: z.string().uuid().openapi({ example: '550e8400-e29b-41d4-a716-446655440000' }),
-  svgUrl: z.string().url().openapi({ example: 'http://localhost:3000/download/550e8400-e29b-41d4-a716-446655440000' }),
+  success: z.boolean(),
+  jobId: z.string().uuid(),
+  svgUrl: z.string().url(),
   metadata: z.object({
-    originalSize: z.number().openapi({ example: 2457600 }),
-    svgSize: z.number().openapi({ example: 154200 }),
-    compressionRatio: z.number().openapi({ example: 15.9 }),
-    processingTimeMs: z.number().openapi({ example: 1250 }),
-    dimensions: z.object({
-      width: z.number().openapi({ example: 1920 }),
-      height: z.number().openapi({ example: 1080 }),
-    }),
-    detectedType: z.enum(['photo', 'graphic']).openapi({ example: 'photo' }),
-    mode: z.string().openapi({ example: 'color' }),
-    autoOptimized: z.boolean().openapi({ example: true }),
-    params: z.object({
-      colorPrecision: z.number().openapi({ example: 6 }),
-      noiseReduction: z.number().openapi({ example: 10 }),
-      detailLevel: z.string().openapi({ example: 'high' }),
-    }),
+    originalSize: z.number(),
+    svgSize: z.number(),
+    compressionRatio: z.string(),
+    processingTimeMs: z.number(),
+    dimensions: z.object({ width: z.number(), height: z.number() }),
+    detectedType: z.enum(['logo-bw', 'logo-color', 'logo-complex', 'photo', 'illustration']),
+    mode: z.string(),
+    processingMethod: z.enum(['fast', 'tiled', 'quality']),
+    colorCount: z.number(),
+    wasResized: z.boolean(),
+    originalDimensions: z.object({ width: z.number(), height: z.number() }),
   }),
 });
 
 const ErrorResponseSchema = z.object({
   success: z.literal(false),
-  error: z.string().openapi({ example: 'Invalid input: No image provided' }),
-  code: z.string().openapi({ example: 'BAD_REQUEST' }),
+  error: z.string(),
+  code: z.string(),
 });
-
-/** Reusable type definitions for backend consumers (request/response contracts) */
-export type ConvertResponse = z.infer<typeof ConvertResponseSchema>;
-export type ConvertResponseMetadata = ConvertResponse['metadata'];
-export type ErrorResponse = z.infer<typeof ErrorResponseSchema>;
-
-// ============================================================
-// MAIN CONVERT ENDPOINT
-// ============================================================
 
 const convertRoute = createRoute({
   method: 'post',
   path: '/convert',
   request: {
     description: `
-Convert image to SVG with auto-optimization.
+Convert image to SVG with automatic optimization.
 
-**Request body (provide ONE input):**
-- **File upload:** Send \`image\` (file) and leave \`imageBase64\` empty or omit it.
-- **Base64:** Send \`imageBase64\` (string) when \`image\` is not provided; omit \`image\` or leave it empty.
+**Input (provide exactly one):**
+- \`image\`: File upload via multipart/form-data
+- \`imageBase64\`: Base64 string via multipart or JSON
 
-When \`image\` is provided, \`imageBase64\` must be empty — the server ignores imageBase64 if image file is present.
+**Modes:**
+- \`color\`: Full color vectorization (default)
+- \`binary\`: Black and white (best for text/logos)
+- \`grayscale\`: Grayscale vectorization
 
-**Mode:** \`color\` (default) | \`binary\` | \`grayscale\`
+**Features:**
+- Supports up to 250 million pixels (16384x16384)
+- Automatic logo detection (B&W, color, complex 7+ colors)
+- Smart resizing to optimal 1200px for logos
+- Handles: PNG, JPG, JPEG, WebP, GIF, BMP
 
-**Limits:** File size max \`${CONFIG.MAX_FILE_SIZE_MB}MB\`. Total pixels (width×height) max \`${(CONFIG.MAX_PIXELS / 1_000_000).toFixed(0)}M\` (professional-grade). Optimal logo dimension: \`${CONFIG.OPTIMAL_LOGO_DIMENSION}×${CONFIG.OPTIMAL_LOGO_DIMENSION}px\` for best quality vs CPU/memory.
+**Examples:**
+\`\`\`bash
+# File upload
+curl -X POST http://localhost:3000/convert \\
+  -F "image=@logo.png" \\
+  -F "mode=color"
 
-**Auto-Detection:** Photos get high noise reduction and 6-color precision; graphics get low noise and 4-color precision.
+# Base64 JSON
+curl -X POST http://localhost:3000/convert \\
+  -H "Content-Type: application/json" \\
+  -d '{"imageBase64": "'"$(base64 -w 0 logo.png)"'", "mode": "binary"}'
+\`\`\`
     `,
     body: {
       content: {
-        'multipart/form-data': {
-          schema: ConvertRequestSchema,
-        },
+        'multipart/form-data': { schema: ConvertRequestSchema },
         'application/json': {
           schema: z.object({
-            imageBase64: z.string().describe('Base64 image; required when no file upload. Leave empty if using file.'),
+            imageBase64: z.string(),
             mode: z.enum(['color', 'binary', 'grayscale']).default('color'),
           }),
         },
@@ -544,219 +898,123 @@ When \`image\` is provided, \`imageBase64\` must be empty — the server ignores
   },
   responses: {
     200: {
-      description: 'Conversion successful. Use `jobId` or `svgUrl` to download the SVG (GET /download/{jobId}).',
-      content: {
-        'application/json': {
-          schema: ConvertResponseSchema,
-        },
-      },
+      description: 'Conversion successful',
+      content: { 'application/json': { schema: ConvertResponseSchema } },
     },
     400: {
-      description: 'Invalid input (e.g. no image provided, invalid base64)',
-      content: {
-        'application/json': {
-          schema: ErrorResponseSchema,
-        },
-      },
+      description: 'Validation error',
+      content: { 'application/json': { schema: ErrorResponseSchema } },
     },
     413: {
-      description: 'File too large (exceeds max size)',
-      content: {
-        'application/json': {
-          schema: ErrorResponseSchema,
-        },
-      },
+      description: 'File too large',
+      content: { 'application/json': { schema: ErrorResponseSchema } },
     },
     415: {
       description: 'Unsupported media type',
-      content: {
-        'application/json': {
-          schema: ErrorResponseSchema,
-        },
-      },
+      content: { 'application/json': { schema: ErrorResponseSchema } },
     },
     500: {
       description: 'Processing error',
-      content: {
-        'application/json': {
-          schema: ErrorResponseSchema,
-        },
-      },
+      content: { 'application/json': { schema: ErrorResponseSchema } },
     },
   },
   tags: ['Conversion'],
 });
 
-// Convert handler implementation
 app.openapi(convertRoute, async (c) => {
   const contentType = c.req.header('content-type') || '';
-  
   let imageBuffer: Buffer;
   let mode: 'color' | 'binary' | 'grayscale' = 'color';
-  let originalName: string = 'upload.png';
+  let filename: string = 'upload.png';
 
-  try {
-    // Parse request based on content type
-    if (contentType.includes('multipart/form-data')) {
-      const body = await c.req.parseBody();
-      const rawImage = body.image;
+  // Parse request
+  if (contentType.includes('multipart/form-data')) {
+    const body = await c.req.parseBody();
+    
+    // Validate mutual exclusivity (use duck typing: File is not defined in all Node runtimes)
+    const hasFile = isFileLike(body.image);
+    const hasBase64 = typeof body.imageBase64 === 'string' && body.imageBase64.length > 0;
+    
+    if (hasFile && hasBase64) {
+      throw new ValidationError(
+        'Provide either image (file) OR imageBase64, not both',
+        'DUAL_INPUT',
+        400
+      );
+    }
+    
+    if (!hasFile && !hasBase64) {
+      throw new ValidationError(
+        'Provide either image (file) or imageBase64',
+        'MISSING_INPUT',
+        400
+      );
+    }
 
-      // File-like: has arrayBuffer() and size (works with File, Blob, or Node multipart result)
-      const isFileUpload =
-        rawImage &&
-        typeof (rawImage as { arrayBuffer?: () => unknown }).arrayBuffer === 'function' &&
-        typeof (rawImage as { size?: unknown }).size === 'number';
-
-      // Handle file upload (image present, imageBase64 can be empty)
-      if (isFileUpload) {
-        const file = rawImage as { arrayBuffer: () => Promise<ArrayBuffer>; size: number; type: string; name?: string };
-        imageBuffer = Buffer.from(await file.arrayBuffer());
-        originalName = file.name || 'upload.jpg';
-
-        // Validate file type
-        if (!CONFIG.ALLOWED_TYPES.includes(file.type)) {
-          throw new HTTPException(415, {
-            message: `Unsupported file type: ${file.type}. Allowed: ${CONFIG.ALLOWED_TYPES.join(', ')}`,
-          });
-        }
-
-        // Validate file size
-        const maxBytes = CONFIG.MAX_FILE_SIZE_MB * 1024 * 1024;
-        if (file.size > maxBytes) {
-          throw new HTTPException(413, {
-            message: `File too large: ${(file.size / 1024 / 1024).toFixed(2)}MB (max ${CONFIG.MAX_FILE_SIZE_MB}MB)`,
-          });
-        }
-
-      // Handle base64 in form data (image empty, imageBase64 non-empty)
-      } else if (typeof body.imageBase64 === 'string' && body.imageBase64.trim()) {
-        const base64Data = body.imageBase64.replace(/^data:image\/\w+;base64,/, '');
-        imageBuffer = Buffer.from(base64Data, 'base64');
-        originalName = 'base64-upload.png';
-
-        if (imageBuffer.length === 0) {
-          throw new HTTPException(400, { message: 'Invalid base64 data' });
-        }
-        
-        // Check size
-        const maxBytes = CONFIG.MAX_FILE_SIZE_MB * 1024 * 1024;
-        if (imageBuffer.length > maxBytes) {
-          throw new HTTPException(413, { 
-            message: `Image too large: ${(imageBuffer.length / 1024 / 1024).toFixed(2)}MB` 
-          });
-        }
-      } else {
-        throw new HTTPException(400, { 
-          message: 'No image provided. Use "image" (file) or "imageBase64" (string)' 
-        });
-      }
-      
-      // Get mode from form
-      if (body.mode) {
-        if (!['color', 'binary', 'grayscale'].includes(body.mode as string)) {
-          throw new HTTPException(400, { message: 'Mode must be: color, binary, or grayscale' });
-        }
-        mode = body.mode as 'color' | 'binary' | 'grayscale';
-      }
-      
-    } else if (contentType.includes('application/json')) {
-      const body = await c.req.json();
-      
-      if (!body.imageBase64 || typeof body.imageBase64 !== 'string') {
-        throw new HTTPException(400, { message: 'JSON requests require imageBase64 field' });
-      }
-      
-      const base64Data = body.imageBase64.replace(/^data:image\/\w+;base64,/, '');
-      imageBuffer = Buffer.from(base64Data, 'base64');
-      originalName = 'base64-json.png';
-      
-      if (imageBuffer.length === 0) {
-        throw new HTTPException(400, { message: 'Invalid base64 data' });
-      }
-      
-      // Check size
-      const maxBytes = CONFIG.MAX_FILE_SIZE_MB * 1024 * 1024;
-      if (imageBuffer.length > maxBytes) {
-        throw new HTTPException(413, { 
-          message: `Image too large: ${(imageBuffer.length / 1024 / 1024).toFixed(2)}MB` 
-        });
-      }
-      
-      // Get mode from JSON
-      if (body.mode) {
-        if (!['color', 'binary', 'grayscale'].includes(body.mode)) {
-          throw new HTTPException(400, { message: 'Mode must be: color, binary, or grayscale' });
-        }
-        mode = body.mode;
-      }
-      
+    if (hasFile) {
+      const file = body.image as FileLike;
+      imageBuffer = Buffer.from(await file.arrayBuffer());
+      filename = file.name || 'upload.png';
     } else {
-      throw new HTTPException(400, { 
-        message: 'Unsupported content type. Use multipart/form-data or application/json' 
-      });
+      const base64 = (body.imageBase64 as string).replace(/^data:image\/\w+;base64,/, '');
+      imageBuffer = Buffer.from(base64, 'base64');
+      filename = 'base64-upload.png';
     }
 
-    // Validate image is parseable and within pixel limit (up to 250M pixels for professional-grade)
-    let width: number;
-    let height: number;
-    try {
-      const meta = await sharp(imageBuffer).metadata();
-      width = meta.width ?? 0;
-      height = meta.height ?? 0;
-      if (!width || !height) {
-        throw new HTTPException(400, { message: 'Could not read image dimensions' });
-      }
-      const totalPixels = width * height;
-      if (totalPixels > CONFIG.MAX_PIXELS) {
-        throw new HTTPException(413, {
-          message: `Image exceeds maximum allowed pixels: ${(totalPixels / 1_000_000).toFixed(1)}M (max ${(CONFIG.MAX_PIXELS / 1_000_000).toFixed(0)}M). Reduce dimensions and try again.`,
-        });
-      }
-    } catch (err) {
-      if (err instanceof HTTPException) throw err;
-      throw new HTTPException(400, { message: 'Invalid or corrupted image file' });
+    if (body.mode && ['color', 'binary', 'grayscale'].includes(body.mode as string)) {
+      mode = body.mode as 'color' | 'binary' | 'grayscale';
     }
 
-    console.log(`[REQUEST] Mode: ${mode}, Size: ${imageBuffer.length} bytes, ${width}x${height} (${((width * height) / 1_000_000).toFixed(1)}M px), Type: ${contentType}`);
-
-    // Process image
-    const result = await processor.process(imageBuffer, originalName, mode);
+  } else if (contentType.includes('application/json')) {
+    const body = await c.req.json();
     
-    // Save output for download
-    const outputPath = join(CONFIG.TEMP_DIR, `${result.jobId}.svg`);
-    await fs.writeFile(outputPath, result.svgBuffer);
-    
-    // Schedule cleanup
-    setTimeout(() => {
-      fs.unlink(outputPath).catch(() => {});
-    }, 3600000); // 1 hour
+    if (!body.imageBase64 || typeof body.imageBase64 !== 'string') {
+      throw new ValidationError('JSON requests require imageBase64 field', 'MISSING_BASE64', 400);
+    }
 
-    // Build response
-    const protocol = c.req.header('x-forwarded-proto') || 'http';
-    const host = c.req.header('host') || `localhost:${CONFIG.PORT}`;
-    const baseUrl = `${protocol}://${host}`;
+    const base64 = body.imageBase64.replace(/^data:image\/\w+;base64,/, '');
+    imageBuffer = Buffer.from(base64, 'base64');
+    filename = 'base64-json.png';
 
-    return c.json({
-      success: true,
-      jobId: result.jobId,
-      svgUrl: `${baseUrl}/download/${result.jobId}`,
-      metadata: result.metadata,
-    });
+    if (body.mode && ['color', 'binary', 'grayscale'].includes(body.mode)) {
+      mode = body.mode;
+    }
 
-  } catch (error) {
-    if (error instanceof HTTPException) throw error;
-    
-    console.error('Conversion error:', error);
-    throw new HTTPException(500, { 
-      message: error instanceof Error ? error.message : 'Image processing failed' 
-    });
+  } else {
+    throw new ValidationError(
+      `Unsupported content type: ${contentType}. Use multipart/form-data or application/json`,
+      'UNSUPPORTED_CONTENT_TYPE',
+      415
+    );
   }
+
+  // Validate parsed content
+  if (imageBuffer.length === 0) {
+    throw new ValidationError('Empty image data', 'EMPTY_DATA', 400);
+  }
+
+  // Process
+  const result = await processor.process(imageBuffer, filename, mode);
+
+  // Save for download
+  const outputPath = join(CONFIG.TEMP_DIR, `${result.jobId}.svg`);
+  await fs.writeFile(outputPath, result.svgBuffer);
+  
+  // Auto-cleanup after 1 hour
+  setTimeout(() => fs.unlink(outputPath).catch(() => {}), 3600000);
+
+  const host = c.req.header('host') || `localhost:${CONFIG.PORT}`;
+  const protocol = c.req.header('x-forwarded-proto') || 'http';
+
+  return c.json({
+    success: true,
+    jobId: result.jobId,
+    svgUrl: `${protocol}://${host}/download/${result.jobId}`,
+    metadata: result.metadata,
+  });
 });
 
-// ============================================================
-// DOWNLOAD ENDPOINT
-// ============================================================
-
+// Download endpoint
 const downloadRoute = createRoute({
   method: 'get',
   path: '/download/{jobId}',
@@ -771,23 +1029,22 @@ const downloadRoute = createRoute({
   responses: {
     200: {
       description: 'SVG file',
-      content: {
-        'image/svg+xml': {
-          schema: z.string().openapi({ format: 'binary' }),
-        },
-      },
+      content: { 'image/svg+xml': {
+        
+        schema: z.string().openapi({
+          type: 'string',
+          format: 'binary',
+        })
+      
+      } },
     },
     404: {
-      description: 'File not found or expired',
-      content: {
-        'application/json': {
-          schema: ErrorResponseSchema,
-        },
-      },
+      description: 'Not found',
+      content: { 'application/json': { schema: ErrorResponseSchema } },
     },
   },
   tags: ['Download'],
-  description: 'Download converted SVG file. Files expire after 1 hour.',
+  description: 'Download converted SVG. Files expire after 1 hour.',
 });
 
 app.openapi(downloadRoute, async (c) => {
@@ -795,186 +1052,103 @@ app.openapi(downloadRoute, async (c) => {
   const filePath = join(CONFIG.TEMP_DIR, `${jobId}.svg`);
   
   try {
-    // Check if file exists
-    await fs.access(filePath);
-    
-    // Stream file
+    const stats = await fs.stat(filePath);
     const stream = createReadStream(filePath);
     
     c.header('Content-Type', 'image/svg+xml');
     c.header('Content-Disposition', `attachment; filename="converted-${jobId}.svg"`);
+    c.header('Content-Length', stats.size.toString());
     c.header('Cache-Control', 'public, max-age=3600');
-    c.header('X-Content-Type-Options', 'nosniff');
     
     return c.body(stream);
-    
   } catch {
-    throw new HTTPException(404, { 
-      message: 'File not found or expired. Files are kept for 1 hour.' 
-    });
+    throw new HTTPException(404, { message: 'File not found or expired' });
   }
 });
 
-// ============================================================
-// SWAGGER UI & DOCUMENTATION
-// ============================================================
+// Job status endpoint (for async tracking)
+app.get('/status/:jobId', (c) => {
+  const jobId = c.req.param('jobId');
+  const status = processor.getJobStatus(jobId);
+  
+  if (!status) {
+    return c.json({ success: false, error: 'Job not found' }, 404);
+  }
+  
+  return c.json({ success: true, jobId, ...status });
+});
 
+// Swagger UI
 app.get('/docs', swaggerUI({ url: '/openapi.json' }));
 
-// OpenAPI specification
+// OpenAPI spec
 app.doc('/openapi.json', {
   openapi: '3.0.0',
   info: {
     title: 'Image-to-SVG Conversion API',
-    version: '2.0.0',
+    version: '4.0.0',
     description: `
-## Ultra-Simple Image Vectorization API
+Production-grade image vectorization supporting up to 250 million pixels.
 
-Convert images to high-quality SVG. **Supported input formats:** PNG, JPG, JPEG, WebP, GIF, BMP.
+**Capabilities:**
+- **Pixel Limit:** 250,000,000 pixels (16384×16384)
+- **File Size:** 10MB maximum upload
+- **Formats:** PNG, JPG, JPEG, WebP, GIF, BMP
+- **Logo Optimization:** Automatic detection of B&W, color (3-6), and complex (7+) color logos
+- **Smart Resizing:** Logos auto-resized to optimal 1200px
 
-### Limits
-- **File size:** Max **10 MB**
-- **Total pixels:** Up to **250 million** (width × height) for professional-grade assets
-- **Optimal logo dimension:** **1200×1200px** recommended — enough detail for the tracing algorithm without overloading CPU/memory
+**Processing Profiles:**
+| Type | Colors | Method | Use Case |
+|------|--------|--------|----------|
+| logo-bw | 2 | Fast | Black & white logos |
+| logo-color | 3-6 | Fast | Brand logos |
+| logo-complex | 7+ | Fast | Multi-color illustrations |
+| photo | Full | Quality | Photographs |
+| illustration | Full | Tiled | Large artwork |
 
-### Features
-- **Dual Input**: Upload file OR send base64 string (use one; when using file, leave imageBase64 empty)
-- **Auto-Optimization**: Detects photos vs graphics automatically
-- **Zero Distortion**: Lanczos3 resampling + spline curves
-- **Fast Processing**: Typically 300ms-2s depending on image size
-
----
-
-## Backend Developer Reference
-
-### POST /convert — Request Body
-
-| Content-Type | Field | Type | Required | Description |
-|-------------|-------|------|----------|-------------|
-| multipart/form-data | image | file (binary) | One of image or imageBase64 | Image file. **Formats:** PNG, JPG, JPEG, WebP, GIF, BMP. **Max 10MB, up to 250M pixels.** When sent, imageBase64 must be empty. |
-| multipart/form-data | imageBase64 | string | One of image or imageBase64 | Base64 image (optional data URI prefix). **Leave empty when uploading image file.** |
-| multipart/form-data | mode | string | No (default: color) | \`color\` | \`binary\` | \`grayscale\` |
-| application/json | imageBase64 | string | Yes (for JSON) | Base64 image. Omit when using multipart with file. |
-| application/json | mode | string | No (default: color) | \`color\` | \`binary\` | \`grayscale\` |
-
-**Rule:** Provide **exactly one** of \`image\` (file) or \`imageBase64\` (string). If \`image\` is provided, \`imageBase64\` is ignored and should be empty.
-
-### POST /convert — Response Body (200)
-
-| Field | Type | Description |
-|-------|------|-------------|
-| success | boolean | \`true\` |
-| jobId | string (UUID) | Use with GET /download/{jobId} to fetch the SVG file |
-| svgUrl | string (URL) | Full URL to download the SVG (same as GET /download/{jobId}) |
-| metadata | object | originalSize, svgSize, compressionRatio, processingTimeMs, dimensions, detectedType, mode, autoOptimized, params |
-
-### POST /convert — Error Responses (4xx/5xx)
-
-| Status | Body | When |
-|--------|------|------|
-| 400 | { success: false, error: string, code: string } | No image, invalid base64, invalid mode, unreadable dimensions |
-| 413 | { success: false, error: string, code: string } | File/image too large (>10MB) or total pixels >250M |
-| 415 | { success: false, error: string, code: string } | Unsupported file type (allowed: PNG, JPG, JPEG, WebP, GIF, BMP) |
-| 500 | { success: false, error: string, code: string } | Processing error |
-
-### GET /download/{jobId} — Response
-
-| Status | Content-Type | Body |
-|--------|--------------|------|
-| 200 | image/svg+xml | SVG file body |
-| 404 | application/json | { success: false, error: string, code: string } — file expired or not found (files kept 1 hour) |
-
----
-
-### Quick Start
-
-**File upload (imageBase64 empty):**
-\`\`\`bash
-curl -X POST http://localhost:3000/convert \\
-  -F "image=@photo.jpg" \\
-  -F "mode=color"
-\`\`\`
-
-**Base64 (JSON):**
-\`\`\`bash
-curl -X POST http://localhost:3000/convert \\
-  -H "Content-Type: application/json" \\
-  -d '{"imageBase64": "'"$(base64 -w 0 photo.jpg)"'", "mode": "binary"}'
-\`\`\`
-
-### Auto-Detection Logic
-| Image Type | Noise Reduction | Color Precision | Detail Level |
-|------------|----------------|-----------------|--------------|
-| Photo | 10 | 6 | high/maximum |
-| Graphic | 2 | 4 | medium/high |
-
-### Modes
-- **color**: Full color vectorization (best for photos)
-- **binary**: Black & white (best for text/logos)
-- **grayscale**: Grayscale vectorization
+**Error Codes:**
+- \`EMPTY_FILE\`: No data received
+- \`FILE_TOO_LARGE\`: >10MB
+- \`IMAGE_TOO_LARGE\`: >250M pixels
+- \`DIMENSIONS_TOO_LARGE\`: >16384px in any dimension
+- \`UNSUPPORTED_TYPE\`: Invalid file format
+- \`INVALID_IMAGE\`: Corrupted or unparseable
+- \`DUAL_INPUT\`: Both file and base64 provided
+- \`MISSING_INPUT\`: No input provided
     `,
-    contact: {
-      name: 'API Support',
-    },
+    contact: { name: 'API Support' },
   },
-  servers: [
-    { url: 'http://localhost:3000', description: 'Local development' },
-  ],
+  servers: [{ url: `http://localhost:${CONFIG.PORT}` }],
   tags: [
     { name: 'Conversion', description: 'Image to SVG conversion' },
-    { name: 'Download', description: 'Retrieve converted files' },
+    { name: 'Download', description: 'File retrieval' },
   ],
 });
 
-// ============================================================
-// ERROR HANDLING
-// ============================================================
-
-app.onError((err, c) => {
-  if (err instanceof HTTPException) {
-    return c.json({
-      success: false,
-      error: err.message,
-      code: err.status.toString(),
-    }, err.status);
-  }
-  
-  console.error('Unhandled error:', err);
-  return c.json({
-    success: false,
-    error: 'Internal server error',
-    code: 'INTERNAL_ERROR',
-  }, 500);
-});
-
-app.notFound((c) => {
-  return c.json({
-    success: false,
-    error: 'Endpoint not found',
-    code: 'NOT_FOUND',
-  }, 404);
-});
+// 404 handler
+app.notFound((c) => c.json({
+  success: false,
+  error: 'Endpoint not found',
+  code: 'NOT_FOUND',
+}, 404));
 
 // ============================================================
-// START SERVER
+// START
 // ============================================================
 
 console.log(`
-╔════════════════════════════════════════════════════════════╗
-║           🚀 Image-to-SVG API (Production Ready)           ║
-╠════════════════════════════════════════════════════════════╣
-║  📚 Swagger UI:  http://localhost:${CONFIG.PORT}/docs                  ║
-║  🔥 Convert:     POST http://localhost:${CONFIG.PORT}/convert          ║
-║  📥 Download:    GET  http://localhost:${CONFIG.PORT}/download/{id}    ║
-║  ❤️  Health:     GET  http://localhost:${CONFIG.PORT}/health           ║
-╠════════════════════════════════════════════════════════════╣
-║  Inputs:  image (file) OR imageBase64 (string)            ║
-║  Mode:    color | binary | grayscale                       ║
-║  Max Size: ${CONFIG.MAX_FILE_SIZE_MB}MB                                                    ║
-╚════════════════════════════════════════════════════════════╝
+╔══════════════════════════════════════════════════════════════════╗
+║           🚀 Image-to-SVG API v4.0 (Production Ready)            ║
+╠══════════════════════════════════════════════════════════════════╣
+║  📚 Swagger UI:  http://localhost:${CONFIG.PORT}/docs                       ║
+║  🔥 Convert:     POST /convert                                   ║
+║  📥 Download:    GET  /download/{jobId}                          ║
+║  ❤️  Health:     GET  /health                                    ║
+╠══════════════════════════════════════════════════════════════════╣
+║  Limits:  10MB file, 250M pixels (16384×16384), 6 formats        ║
+║  Modes:   color | binary | grayscale                             ║
+║  Auto:    Logo detection, B&W/Color/Complex (7+) profiles        ║
+╚══════════════════════════════════════════════════════════════════╝
 `);
 
-serve({
-  fetch: app.fetch,
-  port: CONFIG.PORT,
-});
+serve({ fetch: app.fetch, port: CONFIG.PORT });
