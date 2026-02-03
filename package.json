@@ -1,0 +1,27 @@
+{
+    "name": "image-to-svg-api",
+    "version": "2.0.0",
+    "type": "module",
+    "scripts": {
+      "dev": "tsx api.ts",
+      "start": "node dist/api.js",
+      "build": "tsc api.ts --outDir dist --esModuleInterop --target ES2022 --module NodeNext --moduleResolution NodeNext --skipLibCheck",
+      "test:convert": "node test-convert.js"
+    },
+    "dependencies": {
+      "@hono/node-server": "^1.13.0",
+      "@hono/swagger-ui": "^0.4.1",
+      "@hono/zod-openapi": "^0.18.0",
+      "hono": "^4.6.5",
+      "p-queue": "^8.0.1",
+      "sharp": "^0.33.5",
+      "uuid": "^9.0.1",
+      "zod": "^3.23.8"
+    },
+    "devDependencies": {
+      "@types/node": "^20.14.0",
+      "@types/uuid": "^9.0.8",
+      "tsx": "^4.19.1",
+      "typescript": "^5.6.3"
+    }
+  }
