@@ -92,6 +92,7 @@ export interface ConversionMetadata {
   mode: 'color' | 'binary' | 'grayscale';
   processingMethod: 'fast' | 'tiled' | 'quality';
   colorCount: number;
+  edgeSharpness: number;
   wasResized: boolean;
   originalDimensions: ImageDimensions;
 }
@@ -123,6 +124,7 @@ export interface OptimizationParams {
     detectedType: string;
     dimensions: ImageDimensions;
     colorCount: number;
+    edgeSharpness: number;
     wasResized: boolean;
     originalDimensions: ImageDimensions;
   };
@@ -272,6 +274,7 @@ class ImageAnalyzer {
         detectedType: params.type,
         dimensions: targetDims,
         colorCount: logoAnalysis.colorCount,
+        edgeSharpness: logoAnalysis.edgeSharpness,
         wasResized,
         originalDimensions: originalDims,
       }
@@ -422,9 +425,10 @@ class ImageAnalyzer {
 
     // Complex Logo (7+ colors)
     if (analysis.isLogo && analysis.logoType === 'complex') {
+      const needsCleanup = analysis.edgeSharpness > 0.1;
       return {
         type: 'logo-complex',
-        colorPrecision: 4,        // More colors for complex logos
+        colorPrecision: needsCleanup ? 6 : 8,        // More colors for complex logos
         noiseReduction: 0,
         posterize: 16,
         skipEnhancement: true,
@@ -434,9 +438,10 @@ class ImageAnalyzer {
 
     // Color Logo (3-6 colors)
     if (analysis.isLogo) {
+      const needsCleanup = analysis.edgeSharpness > 0.1;
       return {
         type: 'logo-color',
-        colorPrecision: 3,
+        colorPrecision: needsCleanup ? 6 : 8,
         noiseReduction: 0,
         posterize: 32,
         skipEnhancement: true,
@@ -545,6 +550,7 @@ class SVGProcessor {
           processingMethod: params.useTiling ? 'tiled' : 
                            params.type.startsWith('logo') ? 'fast' : 'quality',
           colorCount: params.metadata.colorCount,
+          edgeSharpness: params.metadata.edgeSharpness,
           wasResized: params.metadata.wasResized,
           originalDimensions: params.metadata.originalDimensions,
         }
@@ -672,6 +678,8 @@ cv2.imwrite(r'${output.replace(/\\/g, '\\\\')}', img)
     params: OptimizationParams
   ): Promise<void> {
     const args = [CONFIG.VTRACER_PATH, '--input', input, '--output', output];
+    const isLogo = params.type.startsWith('logo');
+    const logoNeedsCleanup = isLogo && params.metadata.edgeSharpness > 0.1;
 
     switch (mode) {
       case 'binary':
@@ -699,12 +707,32 @@ cv2.imwrite(r'${output.replace(/\\/g, '\\\\')}', img)
           '--colormode', 'color',
           '--color_precision', params.colorPrecision.toString(),
           '--mode', 'spline',
-          '--gradient_step', params.detailLevel === 'maximum' ? '0' : '1',
-          '--filter_speckle', params.type.startsWith('logo') ? '1' : '4'
+          '--filter_speckle', logoNeedsCleanup ? '16' : (isLogo ? '0' : '4')
         );
+
+        if (isLogo) {
+          if (logoNeedsCleanup) {
+            args.push(
+              '--hierarchical', 'stacked',
+              '--layer_difference', '20',
+              '--segment_length', '6',
+              '--path_precision', '6'
+            );
+          } else {
+            args.push(
+              '--hierarchical', 'stacked',
+              '--layer_difference', '10',
+              '--length_threshold', '4.0',
+              '--splice_threshold', '45',
+              '--path_precision', '8'
+            );
+          }
+        } else {
+          args.push('--gradient_step', params.detailLevel === 'maximum' ? '0' : '1');
+        }
         
         if (params.detailLevel === 'maximum') {
-          args.push('--corner_threshold', '60');
+          args.push('--corner_threshold', logoNeedsCleanup ? '45' : '60');
         }
     }
 
@@ -826,6 +854,7 @@ const ConvertResponseSchema = z.object({
     mode: z.string(),
     processingMethod: z.enum(['fast', 'tiled', 'quality']),
     colorCount: z.number(),
+    edgeSharpness: z.number(),
     wasResized: z.boolean(),
     originalDimensions: z.object({ width: z.number(), height: z.number() }),
   }),
