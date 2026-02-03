@@ -424,7 +424,7 @@ class ImageAnalyzer {
     if (analysis.isLogo && analysis.logoType === 'complex') {
       return {
         type: 'logo-complex',
-        colorPrecision: 4,        // More colors for complex logos
+        colorPrecision: 8,        // More colors for complex logos
         noiseReduction: 0,
         posterize: 16,
         skipEnhancement: true,
@@ -436,7 +436,7 @@ class ImageAnalyzer {
     if (analysis.isLogo) {
       return {
         type: 'logo-color',
-        colorPrecision: 3,
+        colorPrecision: 8,
         noiseReduction: 0,
         posterize: 32,
         skipEnhancement: true,
@@ -672,6 +672,7 @@ cv2.imwrite(r'${output.replace(/\\/g, '\\\\')}', img)
     params: OptimizationParams
   ): Promise<void> {
     const args = [CONFIG.VTRACER_PATH, '--input', input, '--output', output];
+    const isLogo = params.type.startsWith('logo');
 
     switch (mode) {
       case 'binary':
@@ -699,9 +700,20 @@ cv2.imwrite(r'${output.replace(/\\/g, '\\\\')}', img)
           '--colormode', 'color',
           '--color_precision', params.colorPrecision.toString(),
           '--mode', 'spline',
-          '--gradient_step', params.detailLevel === 'maximum' ? '0' : '1',
-          '--filter_speckle', params.type.startsWith('logo') ? '1' : '4'
+          '--filter_speckle', isLogo ? '0' : '4'
         );
+
+        if (isLogo) {
+          args.push(
+            '--hierarchical', 'stacked',
+            '--layer_difference', '10',
+            '--length_threshold', '4.0',
+            '--splice_threshold', '45',
+            '--path_precision', '8'
+          );
+        } else {
+          args.push('--gradient_step', params.detailLevel === 'maximum' ? '0' : '1');
+        }
         
         if (params.detailLevel === 'maximum') {
           args.push('--corner_threshold', '60');
