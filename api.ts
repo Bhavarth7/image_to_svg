@@ -674,12 +674,12 @@ cv2.imwrite(r'${output.replace(/\\/g, '\\\\')}', img)
     const args = [CONFIG.VTRACER_PATH, '--input', input, '--output', output];
     const isLogo = params.type.startsWith('logo');
 
+    // Use only args supported by minimal vtracer CLI: colormode, color_precision, filter_speckle, hierarchical, input, mode, output
     switch (mode) {
       case 'binary':
         args.push(
           '--colormode', 'bw',
           '--mode', 'spline',
-          '--corner_threshold', '30',
           '--filter_speckle', '2',
           '--color_precision', '1'
         );
@@ -687,10 +687,11 @@ cv2.imwrite(r'${output.replace(/\\/g, '\\\\')}', img)
       
       case 'grayscale':
         args.push(
-          '--colormode', 'gray',
+          '--colormode', 'color',
           '--color_precision', '5',
           '--mode', 'spline',
-          '--gradient_step', '1'
+          '--filter_speckle', '4',
+          '--hierarchical', 'stacked'
         );
         break;
       
@@ -700,24 +701,9 @@ cv2.imwrite(r'${output.replace(/\\/g, '\\\\')}', img)
           '--colormode', 'color',
           '--color_precision', params.colorPrecision.toString(),
           '--mode', 'spline',
-          '--filter_speckle', isLogo ? '0' : '4'
+          '--filter_speckle', isLogo ? '0' : '4',
+          '--hierarchical', 'stacked'
         );
-
-        if (isLogo) {
-          args.push(
-            '--hierarchical', 'stacked',
-            '--layer_difference', '10',
-            '--length_threshold', '4.0',
-            '--splice_threshold', '45',
-            '--path_precision', '8'
-          );
-        } else {
-          args.push('--gradient_step', params.detailLevel === 'maximum' ? '0' : '1');
-        }
-        
-        if (params.detailLevel === 'maximum') {
-          args.push('--corner_threshold', '60');
-        }
     }
 
     try {
